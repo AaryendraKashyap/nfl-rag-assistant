@@ -1,29 +1,58 @@
+"""Extract the season-wide CSV files from the dataset archive into data/raw.
 
+Only the top-level season files are extracted (<year>_plays.csv and
+2010-2026_scores.csv). The weekly CSVs inside the archive are duplicates of
+the same plays and would be ingested twice.
+
+Usage:
+    python extract_data.py
+    python extract_data.py --archive path/to/archive.zip --out data/raw
+"""
+
+import argparse
+import shutil
 from pathlib import Path
 from zipfile import ZipFile
 
-archive_path = Path("archive.zip")
-output_dir = Path("data/raw")
-output_dir.mkdir(parents=True, exist_ok=True)
+ROOT = Path(__file__).resolve().parent
+SCORES_FILE = "2010-2026_scores.csv"
 
-# Extract only the top-level season CSV files.
-# This avoids extracting duplicate weekly CSVs.
-with ZipFile(archive_path, "r") as archive:
-    for member in archive.namelist():
-        path = Path(member)
 
-        if (
-            len(path.parts) == 1
-            and path.suffix.lower() == ".csv"
-            and (
-                path.name.endswith("_plays.csv")
-                or path.name == "2010-2026_scores.csv"
-            )
-        ):
-            target = output_dir / path.name
+def wanted(member):
+    path = Path(member)
 
+    return (
+        len(path.parts) == 1
+        and path.suffix.lower() == ".csv"
+        and (path.name.endswith("_plays.csv") or path.name == SCORES_FILE)
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--archive", type=Path, default=ROOT / "archive.zip")
+    parser.add_argument("--out", type=Path, default=ROOT / "data" / "raw")
+    args = parser.parse_args()
+
+    if not args.archive.exists():
+        raise SystemExit(f"Archive not found: {args.archive}")
+
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    with ZipFile(args.archive, "r") as archive:
+        for member in archive.namelist():
+            if not wanted(member):
+                continue
+
+            target = args.out / Path(member).name
+
+            # Stream to disk instead of loading each CSV into memory.
             with archive.open(member) as source, target.open("wb") as dest:
-                dest.write(source.read())
+                shutil.copyfileobj(source, dest)
 
-print("Dataset extraction completed.")
-print("Files:", len(list(output_dir.glob("*.csv"))))
+    print("Dataset extraction completed.")
+    print("Files:", len(list(args.out.glob("*.csv"))))
+
+
+if __name__ == "__main__":
+    main()

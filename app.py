@@ -1,7 +1,13 @@
 
 import streamlit as st
 
-from src.rag import ask_question, collection
+from src.rag import (
+    FIRST_SEASON,
+    LAST_SEASON,
+    DatabaseNotReady,
+    ask_question,
+    get_collection,
+)
 
 st.set_page_config(
     page_title="NFL RAG Assistant",
@@ -12,8 +18,13 @@ st.set_page_config(
 st.title("🏈 NFL RAG Assistant")
 st.caption("Ask questions about NFL plays and game scores.")
 
-# Display the database count without scanning all records.
-total_records = collection.count()
+# The database is opened lazily, so a missing database shows a message here
+# instead of crashing when the module is imported.
+try:
+    total_records = get_collection().count()
+except DatabaseNotReady as exc:
+    st.error(str(exc))
+    st.stop()
 
 if total_records == 0:
     st.warning(
@@ -22,7 +33,7 @@ if total_records == 0:
     st.stop()
 
 # Use known seasons instead of scanning 900,000+ records.
-seasons = list(range(2026, 2009, -1))
+seasons = list(range(LAST_SEASON, FIRST_SEASON - 1, -1))
 
 with st.sidebar:
     st.header("Search filters")
@@ -84,7 +95,14 @@ if st.button("Ask", type="primary"):
                 )
 
                 st.subheader("Answer")
-                st.write(result["answer"])
+
+                if result.get("llm_error"):
+                    st.error(result["answer"])
+                else:
+                    st.write(result["answer"])
+
+                if result.get("warning"):
+                    st.info(result["warning"])
 
                 with st.expander("Retrieved evidence", expanded=True):
                     if not result["sources"]:

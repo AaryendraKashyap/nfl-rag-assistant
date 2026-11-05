@@ -1,58 +1,61 @@
+"""Quick health check of the ChromaDB collection (read-only).
 
+Counts records per season and record type with metadata filters, instead of
+paging through the metadata of every record, so it finishes in seconds.
+
+Usage:
+    python check_database.py
+"""
+
+import sys
 from pathlib import Path
-from collections import Counter
 
 import chromadb
 
-db_path = Path("chroma_db").resolve()
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
 
-client = chromadb.PersistentClient(path=str(db_path))
-collection = client.get_collection("nfl_plays")
+from src.rag import COLLECTION_NAME, DB_DIR, FIRST_SEASON, LAST_SEASON  # noqa: E402
 
-print(f"Total records: {collection.count():,}")
 
-season_counts = Counter()
-type_counts = Counter()
-source_counts = Counter()
+def main():
+    client = chromadb.PersistentClient(path=str(DB_DIR))
+    collection = client.get_collection(COLLECTION_NAME)
+    total = collection.count()
 
-offset = 0
-batch_size = 5000
-total = collection.count()
+    print(f"Total records: {total:,}\n")
+    print(f"{'season':<8}{'play':>10}{'score':>8}")
 
-print("\nReading stored metadata...")
+    counted = 0
 
-while offset < total:
-    result = collection.get(
-        limit=batch_size,
-        offset=offset,
-        include=["metadatas"],
-    )
+    for season in range(FIRST_SEASON, LAST_SEASON + 1):
+        row = {}
 
-    if not result["ids"]:
-        break
+        for record_type in ("play", "score"):
+            ids = collection.get(
+                where={"$and": [
+                    {"season": season},
+                    {"record_type": record_type},
+                ]},
+                include=[],
+            )["ids"]
+            row[record_type] = len(ids)
 
-    for metadata in result["metadatas"]:
-        if not metadata:
-            continue
+        counted += row["play"] + row["score"]
+        print(f"{season:<8}{row['play']:>10,}{row['score']:>8,}")
 
-        if "season" in metadata:
-            season_counts[int(metadata["season"])] += 1
+    missing = total - counted
 
-        type_counts[metadata.get("record_type", "unknown")] += 1
-        source_counts[metadata.get("source_file", "unknown")] += 1
+    print(f"\nCounted: {counted:,}")
 
-    offset += len(result["ids"])
-    print(f"\rChecked {offset:,}/{total:,} records", end="", flush=True)
+    if missing:
+        print(
+            f"WARNING: {missing:,} records have no season/record_type "
+            "metadata (or a season outside the range above)."
+        )
+    else:
+        print("All records have season and record_type metadata.")
 
-print("\n\nRECORDS BY SEASON")
-for season, count in sorted(season_counts.items()):
-    print(f"{season}: {count:,}")
 
-print("\nRECORDS BY TYPE")
-for record_type, count in type_counts.items():
-    print(f"{record_type}: {count:,}")
-
-print("\nNUMBER OF DISTINCT SOURCE FILES")
-print(len(source_counts))
-
-print("\nDATABASE VERIFICATION COMPLETE")
+if __name__ == "__main__":
+    main()

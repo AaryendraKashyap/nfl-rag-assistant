@@ -6,7 +6,20 @@ import ollama
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 
+# ---- Settings (must match what src/ingest.py used to build the database) ----
+COLLECTION_NAME = "nfl_plays"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+LLM_MODEL = "llama3"
+FIRST_SEASON = 2010
+LAST_SEASON = 2026
+
+# temperature 0 keeps answers repeatable; num_ctx stops Ollama silently
+# truncating the prompt; num_predict is high enough to finish a sentence.
+LLM_OPTIONS = {"temperature": 0, "num_ctx": 8192, "num_predict": 512}
+
+
 TEAM_NAMES = {
+    "AZ": "Arizona Cardinals",
     "ARI": "Arizona Cardinals", "ATL": "Atlanta Falcons", "BAL": "Baltimore Ravens",
     "BUF": "Buffalo Bills", "CAR": "Carolina Panthers", "CHI": "Chicago Bears",
     "CIN": "Cincinnati Bengals", "CLE": "Cleveland Browns", "DAL": "Dallas Cowboys",
@@ -33,15 +46,125 @@ def team_label(abbreviation):
 ROOT = Path(__file__).resolve().parents[1]
 DB_DIR = ROOT / "chroma_db"
 
-embedding_function = SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
+_collection = None
+
+
+class DatabaseNotReady(RuntimeError):
+    """Raised when the Chroma database has not been built yet."""
+
+
+def get_collection():
+    """Open the existing collection lazily (no work happens at import time)."""
+    global _collection
+
+    if _collection is None:
+        embedding_function = SentenceTransformerEmbeddingFunction(
+            model_name=EMBEDDING_MODEL
+        )
+        client = chromadb.PersistentClient(path=str(DB_DIR))
+
+        try:
+            _collection = client.get_collection(
+                name=COLLECTION_NAME,
+                embedding_function=embedding_function,
+            )
+        except Exception as exc:
+            raise DatabaseNotReady(
+                f"Collection '{COLLECTION_NAME}' was not found in {DB_DIR}. "
+                "Run `python src/ingest.py` first."
+            ) from exc
+
+    return _collection
+
+
+def record_week(record):
+    """Week label of a record. Uses metadata if present, else the document text.
+
+    The existing database stores the week only inside the document text
+    ("Week: HALL OF FAME."), not in metadata, so the fallback is required.
+    """
+    week = (record.get("metadata") or {}).get("week")
+    if week:
+        return str(week).strip().upper()
+
+    match = re.search(
+        r"\bWeek:\s*(.+?)(?:\.\s+Date:|;\s)",
+        record.get("document", ""),
+    )
+    return match.group(1).strip().upper() if match else ""
+
+
+def chronological_key(record):
+    """Sort key giving source order: (season, row number in the CSV)."""
+    metadata = record.get("metadata") or {}
+    row_number = metadata.get("row_number")
+
+    if row_number is None:
+        row_number = record_number(record["id"])
+
+    return int(metadata.get("season", 0)), int(row_number)
+
+
+# Outcome phrases as stored in the documents ("Outcome: Touchdown. Description: ...").
+# Filtering on these server-side is exact, unlike "is_scoring_play", which is 1
+# for touchdowns, field goals AND extra points.
+OUTCOME_PATTERNS = (
+    (r"\btouchdowns?\b|\btds?\b", "Outcome: Touchdown."),
+    (r"\bfield goals?\b", "Outcome: Field Goal."),
+    (r"\bextra points?\b", "Outcome: Extra Point."),
+    (r"\binterceptions?\b|\bpick[- ]?six(?:es)?\b", "Outcome: Interception."),
+    (r"\bfumbles?\b", "Outcome: Fumble."),
+    (r"\bpunts?\b", "Outcome: Punt."),
+    (r"\bsacks?\b", "Yard Sack."),
+    (r"\bkick[- ]?offs?\b", "Outcome: Kickoff"),
 )
 
-client = chromadb.PersistentClient(path=str(DB_DIR))
-collection = client.get_collection(
-    name="nfl_plays",
-    embedding_function=embedding_function,
+AGGREGATE_PATTERN = re.compile(
+    r"\b(how many|most|least|fewest|total|totals|average|avg|leader|leaders|"
+    r"leading|ranked|ranking|rank|highest|lowest|longest|shortest|best|worst|"
+    r"top \d+|per game|all[- ]time)\b"
 )
+
+AGGREGATE_WARNING = (
+    "This assistant answers from the few records it retrieves, so it cannot "
+    "reliably count, rank or total across a season. Treat any numbers as "
+    "based on the retrieved sample only."
+)
+
+
+def infer_outcome_filter(question):
+    """Return a Chroma where_document filter for the play type asked about."""
+    q = question.lower()
+    phrases = [
+        phrase for pattern, phrase in OUTCOME_PATTERNS
+        if re.search(pattern, q)
+    ]
+
+    if not phrases:
+        return None
+
+    if len(phrases) == 1:
+        return {"$contains": phrases[0]}
+
+    return {"$or": [{"$contains": phrase} for phrase in phrases]}
+
+
+def is_aggregate_question(question):
+    """True for count/rank/total questions that retrieval cannot answer."""
+    return bool(AGGREGATE_PATTERN.search(question.lower()))
+
+
+def combine_document_filters(*filters):
+    """AND together any non-empty where_document filters."""
+    active = [f for f in filters if f]
+
+    if not active:
+        return None
+
+    if len(active) == 1:
+        return active[0]
+
+    return {"$and": active}
 
 
 def infer_question_settings(question, season, scoring_only, record_type):
@@ -68,8 +191,8 @@ def infer_question_settings(question, season, scoring_only, record_type):
         end_year = int(range_match.group(2))
 
         if (
-            2010 <= start_year <= 2026
-            and 2010 <= end_year <= 2026
+            FIRST_SEASON <= start_year <= LAST_SEASON
+            and FIRST_SEASON <= end_year <= LAST_SEASON
             and start_year <= end_year
         ):
             seasons = list(range(start_year, end_year + 1))
@@ -78,7 +201,7 @@ def infer_question_settings(question, season, scoring_only, record_type):
         years = [
             int(year)
             for year in re.findall(r"\b(20\d{2})\b", q)
-            if 2010 <= int(year) <= 2026
+            if FIRST_SEASON <= int(year) <= LAST_SEASON
         ]
         years = list(dict.fromkeys(years))
 
@@ -107,10 +230,10 @@ def infer_question_settings(question, season, scoring_only, record_type):
         if any(phrase in q for phrase in score_phrases) or asks_teams_in_named_game or asks_score_in_named_game:
             record_type = "score"
 
-    if record_type != "score" and any(
-        term in q
-        for term in ("touchdown", "touchdowns", "scoring plays")
-    ):
+    # "touchdown" is no longer mapped to is_scoring_play: that flag is also 1
+    # for field goals and extra points. Touchdowns are matched exactly through
+    # infer_outcome_filter() instead.
+    if record_type != "score" and "scoring plays" in q:
         scoring_only = True
 
     return season, seasons, scoring_only, record_type
@@ -247,18 +370,26 @@ def filter_score_records(records, question):
     return filtered
 
 
-def get_all_records(where, batch_size=500):
-    """Retrieve matching records in batches to avoid oversized queries."""
+def get_all_records(where, where_document=None, batch_size=500):
+    """Retrieve every matching record, paging through Chroma."""
+    collection = get_collection()
     records = []
     offset = 0
 
     while True:
-        result = collection.get(
-            where=where,
-            limit=batch_size,
-            offset=offset,
-            include=["documents", "metadatas"],
-        )
+        kwargs = {
+            "limit": batch_size,
+            "offset": offset,
+            "include": ["documents", "metadatas"],
+        }
+
+        if where is not None:
+            kwargs["where"] = where
+
+        if where_document is not None:
+            kwargs["where_document"] = where_document
+
+        result = collection.get(**kwargs)
 
         ids = result["ids"]
         documents = result["documents"] or []
@@ -284,78 +415,23 @@ def get_all_records(where, batch_size=500):
     return records
 
 
-def retrieve_hall_of_fame_game(where):
+HALL_OF_FAME_MARKER = {"$contains": "Week: HALL OF FAME."}
+
+
+def retrieve_hall_of_fame_game(play_where, outcome_filter=None):
     """
     Retrieve Hall of Fame Game play records in source order.
 
-    Records are fetched in batches, filtered to the specific game,
-    and sorted by row_number. The database is read-only here.
+    The week is matched inside Chroma (where_document) instead of paging
+    through every play of the season and filtering in Python. The existing
+    documents contain "Week: HALL OF FAME." so no re-ingest is needed.
     """
-    game_records = []
-    offset = 0
-    batch_size = 500
+    records = get_all_records(
+        play_where,
+        combine_document_filters(HALL_OF_FAME_MARKER, outcome_filter),
+    )
 
-    while True:
-        page = collection.get(
-            where=where,
-            limit=batch_size,
-            offset=offset,
-            include=["documents", "metadatas"],
-        )
-
-        page_ids = page["ids"]
-        page_documents = page["documents"] or []
-        page_metadatas = page["metadatas"] or []
-
-        for index, record_id in enumerate(page_ids):
-            document = page_documents[index]
-            metadata = page_metadatas[index] or {}
-
-            week = str(metadata.get("week", "")).upper()
-
-            # Some indexed records store the week in the document
-            # rather than in metadata.
-            is_hall_of_fame = (
-                week == "HALL OF FAME"
-                or "Week: HALL OF FAME." in document
-            )
-
-            if (
-                metadata.get("record_type") == "play"
-                and is_hall_of_fame
-            ):
-                game_records.append(
-                    {
-                        "id": record_id,
-                        "document": document,
-                        "metadata": metadata,
-                        "distance": None,
-                    }
-                )
-
-        received = len(page_ids)
-
-        if received < batch_size:
-            break
-
-        offset += received
-
-    def chronological_key(record):
-        metadata = record["metadata"]
-
-        row_number = metadata.get("row_number")
-
-        if row_number is None:
-            row_number = record_number(record["id"])
-
-        return (
-            int(metadata.get("season", 0)),
-            int(row_number),
-        )
-
-    game_records.sort(key=chronological_key)
-
-    return game_records
+    return sorted(records, key=chronological_key)
 
 
 def select_key_game_records(records, limit=28):
@@ -392,6 +468,52 @@ def select_key_game_records(records, limit=28):
     return [ordered[i] for i in indices]
 
 
+def query_candidates(question, where, where_document, n_results):
+    """Semantic search with optional metadata and document filters."""
+    kwargs = {
+        "query_texts": [question],
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+
+    if where is not None:
+        kwargs["where"] = where
+
+    if where_document is not None:
+        kwargs["where_document"] = where_document
+
+    result = get_collection().query(**kwargs)
+
+    documents = result["documents"][0] if result["documents"] else []
+    metadatas = result["metadatas"][0] if result["metadatas"] else []
+    ids = result["ids"][0] if result["ids"] else []
+    distances = result["distances"][0] if result["distances"] else []
+
+    candidates = {}
+
+    for index, document in enumerate(documents):
+        candidates[ids[index]] = {
+            "id": ids[index],
+            "document": document,
+            "metadata": metadatas[index] or {},
+            "distance": (
+                distances[index] if index < len(distances) else None
+            ),
+        }
+
+    return candidates
+
+
+QUESTION_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "what",
+    "which", "who", "when", "where", "how", "did", "do",
+    "does", "me", "show", "tell", "about", "from", "in",
+    "of", "and", "or", "to", "for", "played", "play",
+    "game", "games", "season", "please", "on", "opening",
+    "happened", "during", "their",
+}
+
+
 def retrieve_plays(
     question,
     season=None,
@@ -400,7 +522,9 @@ def retrieve_plays(
     record_type="All",
 ):
     """Retrieve relevant NFL records for a question."""
-    if collection.count() == 0:
+    total = get_collection().count()
+
+    if total == 0:
         return []
 
     season, seasons, scoring_only, record_type = (
@@ -422,152 +546,85 @@ def retrieve_plays(
     q = question.lower()
 
     is_score_question = record_type == "score"
-    is_kickoff_question = (
-        "kickoff" in q or "kick off" in q
-    )
+    is_kickoff_question = "kickoff" in q or "kick off" in q
     is_hall_of_fame = "hall of fame" in q
+    outcome_filter = infer_outcome_filter(question)
 
     # Broad Hall of Fame Game questions need the entire game sequence,
     # not a semantic shortlist that can mix unrelated games.
-    #
-    # Require a season to avoid scanning the entire multi-season database.
-    # Specific kickoff questions continue through the targeted path below.
+    # Require a season so the lookup stays small.
     if (
         is_hall_of_fame
         and not is_kickoff_question
         and not is_score_question
         and (season is not None or seasons)
     ):
-        game_records = retrieve_hall_of_fame_game(where)
+        play_where = build_where_filter(
+            season=season,
+            seasons=seasons,
+            scoring_only=scoring_only,
+            record_type="play",
+        )
+        game_records = retrieve_hall_of_fame_game(
+            play_where, outcome_filter
+        )
 
         if game_records:
             return game_records
 
     # Score questions use score records directly.
     if is_score_question:
-        records = get_all_records(where)
+        records = get_all_records(
+            where,
+            {"$contains": "Week: HALL OF FAME"} if is_hall_of_fame else None,
+        )
         records = filter_score_records(records, question)
 
-        return sorted(
-            records,
-            key=lambda record: (
-                int(record["metadata"].get("season", 0)),
-                record_number(record["id"]),
+        return sorted(records, key=chronological_key)
+
+    hall_of_fame_filter = HALL_OF_FAME_MARKER if is_hall_of_fame else None
+
+    # "Opening kickoff of the Hall of Fame game": deterministic, not semantic.
+    if is_kickoff_question and "opening" in q and is_hall_of_fame:
+        play_where = build_where_filter(
+            season=season,
+            seasons=seasons,
+            scoring_only=False,
+            record_type="play",
+        )
+        kickoffs = get_all_records(
+            play_where,
+            combine_document_filters(
+                hall_of_fame_filter, outcome_filter
             ),
         )
 
-    # Normal semantic retrieval with active metadata filters.
-    total = collection.count()
+        if kickoffs:
+            return sorted(kickoffs, key=chronological_key)[:top_k]
+
+    # Normal semantic retrieval, narrowed server-side by season, record type,
+    # and (when the question names one) the play outcome.
     candidate_k = min(max(top_k * 10, 50), total)
 
-    result = collection.query(
-        query_texts=[question],
-        n_results=candidate_k,
-        where=where,
-        include=["documents", "metadatas", "distances"],
+    candidates = query_candidates(
+        question,
+        where,
+        combine_document_filters(hall_of_fame_filter, outcome_filter),
+        candidate_k,
     )
 
-    candidates = {}
+    # The outcome word may not be a hard requirement, so retry without it.
+    if not candidates and outcome_filter:
+        candidates = query_candidates(
+            question, where, hall_of_fame_filter, candidate_k
+        )
 
-    documents = result["documents"][0] if result["documents"] else []
-    metadatas = result["metadatas"][0] if result["metadatas"] else []
-    ids = result["ids"][0] if result["ids"] else []
-    distances = result["distances"][0] if result["distances"] else []
-
-    for index, document in enumerate(documents):
-        candidates[ids[index]] = {
-            "id": ids[index],
-            "document": document,
-            "metadata": metadatas[index] or {},
-            "distance": (
-                distances[index]
-                if index < len(distances)
-                else None
-            ),
-        }
-
-    # Supplement semantic retrieval with targeted event searches.
-    search_terms = []
-
-    if is_hall_of_fame:
-        search_terms.append("HALL OF FAME")
-
-    if is_kickoff_question:
-        search_terms.extend(["kicks", "kickoff", "kick off"])
-
-    if scoring_only:
-        search_terms.extend(["TOUCHDOWN", "FIELD GOAL"])
-
-    for term in dict.fromkeys(search_terms):
-        try:
-            kwargs = {
-                "where_document": {"$contains": term},
-                "limit": 1000,
-                "include": ["documents", "metadatas"],
-            }
-
-            if where is not None:
-                kwargs["where"] = where
-
-            extra = collection.get(**kwargs)
-
-            extra_documents = extra["documents"] or []
-            extra_metadatas = extra["metadatas"] or []
-
-            for index, document in enumerate(extra_documents):
-                record_id = extra["ids"][index]
-                metadata = extra_metadatas[index] or {}
-
-                if record_id not in candidates:
-                    candidates[record_id] = {
-                        "id": record_id,
-                        "document": document,
-                        "metadata": metadata,
-                        "distance": None,
-                    }
-
-        except Exception as exc:
-            print(
-                f"Targeted retrieval warning for {term!r}: {exc}"
-            )
-
-    question_terms = set(re.findall(r"[a-z0-9]+", q))
-
-    stopwords = {
-        "the", "a", "an", "is", "are", "was", "were", "what",
-        "which", "who", "when", "where", "how", "did", "do",
-        "does", "me", "show", "tell", "about", "from", "in",
-        "of", "and", "or", "to", "for", "played", "play",
-        "game", "games", "season", "please", "on", "opening",
-        "happened", "during", "their",
-    }
-
-    question_terms -= stopwords
+    question_terms = set(re.findall(r"[a-z0-9]+", q)) - QUESTION_STOPWORDS
 
     def score(record):
-        text = record["document"].lower()
-        metadata = record["metadata"]
-        text_terms = set(re.findall(r"[a-z0-9]+", text))
+        text_terms = set(re.findall(r"[a-z0-9]+", record["document"].lower()))
 
         value = 2.0 * len(question_terms & text_terms)
-
-        if is_hall_of_fame and "hall of fame" in text:
-            value += 15
-
-        if is_kickoff_question:
-            if any(
-                term in text
-                for term in ("kicks", "kickoff", "kick off")
-            ):
-                value += 12
-
-            if str(metadata.get("week", "")).upper() == "HALL OF FAME":
-                value -= record_number(record["id"]) * 0.01
-
-        if scoring_only and (
-            "touchdown" in text or "field goal" in text
-        ):
-            value += 8
 
         distance = record.get("distance")
 
@@ -575,33 +632,6 @@ def retrieve_plays(
             value += max(0.0, 2.0 - float(distance))
 
         return value
-
-    # Prioritize the earliest matching opening Hall of Fame kickoff.
-    if (
-        is_kickoff_question
-        and "opening" in q
-        and is_hall_of_fame
-    ):
-        kickoff_records = [
-            record
-            for record in candidates.values()
-            if (
-                str(record["metadata"].get("week", "")).upper()
-                == "HALL OF FAME"
-                or "Week: HALL OF FAME." in record["document"]
-            )
-            and any(
-                term in record["document"].lower()
-                for term in ("kicks", "kickoff", "kick off")
-            )
-        ]
-
-        if kickoff_records:
-            kickoff_records.sort(
-                key=lambda record: record_number(record["id"])
-            )
-
-            return kickoff_records[:top_k]
 
     ranked = sorted(
         candidates.values(),
@@ -668,6 +698,314 @@ def format_score_records(records, include_winner=False):
     return lines
 
 
+DOCUMENT_PATTERN = re.compile(
+    r"Season: (?P<season>\d+)\. Week: (?P<week>.*?)\. Date: (?P<date>.*?)\. "
+    r"Home team: (?P<home>.*?)\. Away team: (?P<away>.*?)\. "
+    r"Quarter: (?P<quarter>.*?)\. Possession: (?P<possession>.*?)\. "
+    r"Scoring play: \d\. Outcome: (?P<outcome>.*?)\. Description: (?P<description>.*)",
+    re.DOTALL,
+)
+
+
+def compact_document(document):
+    """Shorten a stored play document for the LLM prompt.
+
+    The stored text repeats labels ("Home team: ...") on every play. Dropping
+    them saves roughly 40% of the prompt tokens. Anything that does not match
+    the play format (score records, for example) is passed through unchanged.
+    """
+    match = DOCUMENT_PATTERN.search(document)
+
+    if not match:
+        return document
+
+    f = match.groupdict()
+
+    return (
+        f"{f['season']} {f['week']} | {f['away']} at {f['home']} | "
+        f"{f['quarter']} | possession: {f['possession']} | "
+        f"{f['outcome']} | {f['description']}"
+    )
+
+
+def format_evidence(records):
+    return "\n\n".join(
+        f"[Source ID: {record['id']}]\n{compact_document(record['document'])}"
+        for record in records
+    )
+
+
+SYSTEM_PROMPT = """You are an accurate NFL data assistant specializing in play-by-play analysis.
+
+RULES:
+1. Answer every part of the user's question.
+2. Use only the evidence provided by the user message.
+3. Never invent events, scores, statistics, dates, or player actions.
+4. When asked about a game, describe supported events chronologically.
+5. Connect related plays into a coherent summary.
+6. Cite relevant source IDs using the format [Source ID: 2010_16].
+7. Clearly distinguish confirmed facts from information the evidence
+   does not establish.
+8. Do not claim the evidence covers a complete game unless it does.
+9. For an opening-kickoff question, identify the kickoff record itself.
+10. If the question asks for a count, total, ranking or "most/longest/best"
+    across many plays, say the evidence is only a small sample and do not
+    state a definitive number.
+11. Keep the answer clear and concise."""
+
+
+def call_llm(user_prompt):
+    """Ask Llama 3 (via Ollama). Returns (text, error_message_or_None)."""
+    try:
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            options=LLM_OPTIONS,
+        )
+        return response["message"]["content"], None
+    except Exception as exc:
+        return None, (
+            f"Could not get an answer from {LLM_MODEL} through Ollama "
+            f"({type(exc).__name__}: {exc}). Make sure Ollama is running "
+            f"(`ollama serve`) and the model is installed "
+            f"(`ollama pull {LLM_MODEL}`). The retrieved records are still "
+            "shown below."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Exact counts ("How many touchdowns did Kansas City score in 2020?")
+#
+# Counting by retrieval is impossible (it only sees a few records), so these
+# questions are answered by counting matching records inside ChromaDB with
+# metadata/document filters. No LLM and no re-ingest are involved.
+# ---------------------------------------------------------------------------
+
+# TeamWithPossession is stored with the current franchise name in every season.
+POSSESSION_TEAMS = [
+    "Arizona Cardinals", "Atlanta Falcons", "Baltimore Ravens", "Buffalo Bills",
+    "Carolina Panthers", "Chicago Bears", "Cincinnati Bengals", "Cleveland Browns",
+    "Dallas Cowboys", "Denver Broncos", "Detroit Lions", "Green Bay Packers",
+    "Houston Texans", "Indianapolis Colts", "Jacksonville Jaguars",
+    "Kansas City Chiefs", "Las Vegas Raiders", "Los Angeles Chargers",
+    "Los Angeles Rams", "Miami Dolphins", "Minnesota Vikings",
+    "New England Patriots", "New Orleans Saints", "New York Giants",
+    "New York Jets", "Philadelphia Eagles", "Pittsburgh Steelers",
+    "San Francisco 49ers", "Seattle Seahawks", "Tampa Bay Buccaneers",
+    "Tennessee Titans", "Washington Commanders",
+]
+
+AMBIGUOUS_CITIES = {"new york", "los angeles"}
+
+EXTRA_TEAM_ALIASES = {
+    "niners": "San Francisco 49ers",
+    "bucs": "Tampa Bay Buccaneers",
+    "oakland": "Las Vegas Raiders",
+    "san diego": "Los Angeles Chargers",
+    "st louis": "Los Angeles Rams",
+    "redskins": "Washington Commanders",
+    "jaguars": "Jacksonville Jaguars",
+    "jags": "Jacksonville Jaguars",
+}
+
+
+def _build_team_aliases():
+    aliases = {}
+
+    for full in POSSESSION_TEAMS:
+        parts = full.split()
+        city = " ".join(parts[:-1]).lower()
+        aliases[full.lower()] = full
+        aliases[parts[-1].lower()] = full
+
+        if city not in AMBIGUOUS_CITIES:
+            aliases[city] = full
+
+    aliases.update(EXTRA_TEAM_ALIASES)
+    return aliases
+
+
+TEAM_ALIASES = _build_team_aliases()
+
+COUNT_INTENT = re.compile(r"\bhow many\b|\bnumber of\b|\bcount\b")
+
+# Words that may remain in a counting question once the team, years and play
+# type are removed. Anything else (a player name, "per game", "by quarter"...)
+# means the question is more specific than this feature can answer exactly.
+COUNT_FILLER = {
+    "how", "many", "number", "of", "count", "did", "do", "does", "the", "a",
+    "an", "in", "were", "was", "are", "is", "there", "score", "scored",
+    "scoring", "by", "during", "season", "seasons", "all", "for", "and", "or",
+    "through", "thru", "to", "total", "have", "has", "had", "been", "happen",
+    "happened", "occur", "occurred", "recorded", "regular", "playoff",
+    "playoffs", "postseason", "preseason", "nfl", "kicked", "thrown", "threw",
+    "throw", "from", "s", "their", "team", "overall", "league", "combined",
+}
+COUNT_FILLER_MADE = {"made", "make", "makes", "kick", "kicks"}  # kicks only
+
+OUTCOME_LABELS = {
+    "Outcome: Touchdown.": "touchdown plays",
+    "Outcome: Field Goal.": "made field goals",
+    "Outcome: Extra Point.": "made extra points",
+    "Outcome: Interception.": "interceptions",
+    "Outcome: Fumble.": "fumbles",
+    "Outcome: Punt.": "punts",
+    "Yard Sack.": "sacks",
+    "Outcome: Kickoff": "kickoffs",
+}
+
+
+def find_teams(question_lower):
+    """Return (set of full team names, question text with team words removed)."""
+    found = set()
+    remaining = question_lower
+
+    for alias in sorted(TEAM_ALIASES, key=len, reverse=True):
+        pattern = rf"\b{re.escape(alias)}\b"
+
+        if re.search(pattern, remaining):
+            found.add(TEAM_ALIASES[alias])
+            remaining = re.sub(pattern, " ", remaining)
+
+    return found, remaining
+
+
+def week_group(week):
+    """Preseason / regular season / postseason from a week label."""
+    week = week.upper()
+
+    if week.startswith("PRESEASON") or week == "HALL OF FAME":
+        return "preseason"
+
+    if re.fullmatch(r"WEEK \d+", week):
+        return "regular"
+
+    return "postseason"
+
+
+def season_phrase(season, seasons):
+    if seasons and len(seasons) > 1:
+        years = sorted(seasons)
+        if years == list(range(years[0], years[-1] + 1)):
+            return f"in {years[0]}\u2013{years[-1]}"
+        return "in " + " and ".join(str(y) for y in years)
+
+    if seasons:
+        return f"in {seasons[0]}"
+
+    if season is not None:
+        return f"in {season}"
+
+    return f"across all seasons ({FIRST_SEASON}\u2013{LAST_SEASON})"
+
+
+def answer_count_question(question, season, seasons, record_type, top_k):
+    """Exact answer for "how many <play type> [team] [season]" questions.
+
+    Returns a result dict, or None when the question is not a simple count
+    (the normal retrieval path then handles it).
+    """
+    q = question.lower()
+
+    if (
+        not COUNT_INTENT.search(q)
+        or record_type == "score"
+        or "hall of fame" in q
+    ):
+        return None
+
+    outcome_filter = infer_outcome_filter(question)
+
+    if not outcome_filter or "$or" in outcome_filter:
+        return None
+
+    outcome_phrase = outcome_filter["$contains"]
+
+    teams, remaining = find_teams(q)
+
+    if len(teams) > 1:
+        return None
+
+    # Strip everything we understand; if words are left over, the question is
+    # more specific than a plain count (a player, "per game", ...).
+    for pattern, _phrase in OUTCOME_PATTERNS:
+        remaining = re.sub(pattern, " ", remaining)
+
+    remaining = re.sub(r"\b20\d{2}\b", " ", remaining)
+    allowed = set(COUNT_FILLER)
+
+    if outcome_phrase in ("Outcome: Field Goal.", "Outcome: Extra Point."):
+        allowed |= COUNT_FILLER_MADE
+
+    leftover = [w for w in re.findall(r"[a-z0-9]+", remaining) if w not in allowed]
+
+    if leftover:
+        return None
+
+    team = next(iter(teams)) if teams else None
+
+    where = build_where_filter(
+        season=season, seasons=seasons, record_type="play"
+    )
+    where_document = combine_document_filters(
+        outcome_filter,
+        {"$contains": f"Possession: {team}."} if team else None,
+    )
+
+    records = get_all_records(where, where_document)
+    records.sort(key=chronological_key)
+
+    groups = {"regular": 0, "postseason": 0, "preseason": 0}
+
+    for record in records:
+        groups[week_group(record_week(record))] += 1
+
+    total = len(records)
+
+    scope = None
+    if "regular season" in q:
+        scope = "regular"
+    elif "playoff" in q or "postseason" in q:
+        scope = "postseason"
+    elif "preseason" in q:
+        scope = "preseason"
+
+    headline = groups[scope] if scope else total
+    scope_text = {
+        "regular": "regular-season ",
+        "postseason": "postseason ",
+        "preseason": "preseason ",
+        None: "",
+    }[scope]
+
+    label = OUTCOME_LABELS.get(outcome_phrase, "plays")
+    subject = f" by the {team}" if team else ""
+
+    answer = (
+        f"**{headline:,}** {scope_text}{label}{subject} "
+        f"{season_phrase(season, seasons)}.\n\n"
+        f"Breakdown: regular season {groups['regular']:,}, "
+        f"postseason {groups['postseason']:,}, "
+        f"preseason/Hall of Fame {groups['preseason']:,} "
+        f"(total {total:,}).\n\n"
+        "Counted exactly from the database, not estimated by the model. "
+        "Plays are matched on their recorded outcome and, for a team, on the "
+        "team in possession; scores recorded under a different outcome "
+        "(for example some defensive scores) are not included. "
+        "The records below are examples."
+    )
+
+    return {
+        "answer": answer,
+        "sources": records[:top_k],
+        "warning": None,
+        "llm_error": False,
+    }
+
+
 def ask_question(
     question,
     season=None,
@@ -688,6 +1026,17 @@ def ask_question(
         record_type,
     )
 
+    counted = answer_count_question(
+        question,
+        effective_season,
+        effective_seasons,
+        effective_type,
+        top_k,
+    )
+
+    if counted is not None:
+        return counted
+
     records = retrieve_plays(
         question=question,
         season=effective_season,
@@ -700,8 +1049,7 @@ def ask_question(
         return {
             "answer": (
                 "No matching records were found for those filters. "
-                "For Super Bowl questions, this code checks an explicit "
-                "Super Bowl label or schedule Week 22 in the score record."
+                "Try removing the season/record-type filters or rephrasing."
             ),
             "sources": [],
         }
@@ -769,10 +1117,9 @@ def ask_question(
                 )
         else:
             answer = (
-                "Score records were retrieved, but no final score records "
-                "matched the requested filters. Check whether the dataset "
-                "labels the Super Bowl as Week 22 or includes a Super Bowl "
-                "game-type field."
+                "Score records were retrieved, but none of them is a "
+                "FINAL game for the requested filters (the game may not "
+                "have been played yet)."
             )
 
         return {
@@ -780,19 +1127,13 @@ def ask_question(
             "sources": records,
         }
 
-    # Keep all retrieved source IDs with their evidence.
-    evidence = "\n\n".join(
-        f"[Source ID: {record['id']}]\n{record['document']}"
-        for record in records
+    warning = (
+        AGGREGATE_WARNING if is_aggregate_question(question) else None
     )
 
     is_full_hall_of_fame_game = (
         "hall of fame" in question.lower()
-        and any(
-            str(record["metadata"].get("week", "")).upper() == "HALL OF FAME"
-            or "Week: HALL OF FAME." in record["document"]
-            for record in records
-        )
+        and any(record_week(record) == "HALL OF FAME" for record in records)
         and len(records) > top_k
     )
 
@@ -801,6 +1142,8 @@ def ask_question(
     # The score table is authoritative for the final score; the play log may
     # contain omissions or contradictory scoring events.
     source_records = records
+    evidence_records = records
+
     if is_full_hall_of_fame_game:
         key_records = select_key_game_records(records)
         score_where = build_where_filter(
@@ -810,23 +1153,21 @@ def ask_question(
         )
         try:
             score_records = filter_score_records(
-                get_all_records(score_where), "Hall of Fame Game"
+                get_all_records(
+                    score_where, {"$contains": "Week: HALL OF FAME"}
+                ),
+                "Hall of Fame Game",
             )
         except Exception as exc:
             print(f"Hall of Fame score lookup warning: {exc}")
             score_records = []
 
         # Add score-table evidence to the prompt and the displayed source list.
-        prompt_records = key_records + [r for r in score_records if r["id"] not in {x["id"] for x in key_records}]
-        source_records = prompt_records
-        evidence_records = prompt_records
-    else:
-        evidence_records = records
-
-    evidence = "\n\n".join(
-        f"[Source ID: {record['id']}]\n{record['document']}"
-        for record in evidence_records
-    )
+        key_ids = {x["id"] for x in key_records}
+        evidence_records = key_records + [
+            r for r in score_records if r["id"] not in key_ids
+        ]
+        source_records = evidence_records
 
     if is_full_hall_of_fame_game:
         task_instructions = """
@@ -837,6 +1178,9 @@ Do not calculate an official final score from play-by-play if the score-table
 record is present. If play-by-play appears inconsistent with the score table,
 state that the sources disagree and report the score-table result separately.
 Do not claim every play is shown; the evidence is a compact event selection.
+Write the summary as a bullet list, one event per line in order, starting with
+the quarter. Do not describe drives, plays or details that are not in the
+evidence, and do not add transitions such as "then drove down the field".
 """
     else:
         task_instructions = """
@@ -846,42 +1190,36 @@ from a few individual plays. If the evidence is insufficient to answer
 part of the question, say what is missing.
 """
 
-    prompt = f"""
-You are an accurate NFL data assistant specializing in play-by-play analysis.
+    if warning:
+        task_instructions += f"""
+IMPORTANT: the evidence is only a SAMPLE of {len(evidence_records)} records,
+not every play. Do NOT state totals, counts, rankings or "the most/longest"
+as facts. Describe only what appears in the sample, and begin by saying
+"In the {len(evidence_records)} retrieved records".
+"""
 
-RULES:
-1. Answer every part of the user's question.
-2. Use only the evidence provided below.
-3. Never invent events, scores, statistics, dates, or player actions.
-4. When asked about a game, describe supported events chronologically.
-5. Connect related plays into a coherent summary.
-6. Cite relevant source IDs using the format [Source ID: 2010_16].
-7. Clearly distinguish confirmed facts from information the evidence
-   does not establish.
-8. Do not claim the evidence covers a complete game unless it does.
-9. For an opening-kickoff question, identify the kickoff record itself.
-10. Keep the answer clear and concise.
-
-ADDITIONAL INSTRUCTIONS:
+    user_prompt = f"""ADDITIONAL INSTRUCTIONS:
 {task_instructions}
 
 EVIDENCE:
-{evidence}
+{format_evidence(evidence_records)}
 
 USER QUESTION:
 {question}
 
-Write the answer now, following all rules above.
-"""
-    response = ollama.chat(
-        model="llama3",
-        messages=[{"role": "user", "content": prompt}],
-        options={
-            "num_predict": 160
-        },
-    )
+Write the answer now, following all rules above."""
+
+    answer, error = call_llm(user_prompt)
+
+    if answer is not None and warning:
+        answer = (
+            f"_Based on a sample of {len(evidence_records)} retrieved "
+            f"records, not a full count._\n\n{answer}"
+        )
 
     return {
-        "answer": response["message"]["content"],
+        "answer": answer if answer is not None else error,
         "sources": source_records,
+        "warning": warning,
+        "llm_error": error is not None,
     }
