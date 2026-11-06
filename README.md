@@ -6,8 +6,10 @@ local Llama 3 model, and shows the records behind every answer.
 
 Everything runs locally: ChromaDB for storage, `all-MiniLM-L6-v2` for
 embeddings, Llama 3 through Ollama for generation, and Streamlit for the UI.
+<img width="602" height="302" alt="image" src="https://github.com/user-attachments/assets/8557b3d0-85fe-4fd0-a801-b6dae227502c" />
+<img width="940" height="499" alt="image" src="https://github.com/user-attachments/assets/a632eb48-675d-4d57-974c-3f59f386bd43" />
 
-![App screenshot](screenshot.png)
+
 
 ## Why it is built this way
 
