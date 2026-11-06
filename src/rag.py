@@ -1006,6 +1006,118 @@ def answer_count_question(question, season, seasons, record_type, top_k):
     }
 
 
+FIRST_LAST_INTENT = re.compile(r"\b(first|earliest|opening|last|latest|final)\b")
+
+FIRST_LAST_FILLER = COUNT_FILLER | {
+    "who", "what", "which", "whose", "scored", "score", "first", "earliest",
+    "opening", "last", "latest", "final", "game", "of", "on", "that", "scoring",
+    "play", "plays", "scorer", "season", "year", "nfl", "was", "were", "is",
+    "kicked", "made", "make", "get", "got", "gets", "recorded",
+}
+
+
+def answer_first_last_question(question, season, seasons, record_type):
+    """Exact answer for "who scored the first touchdown in 2010?" questions.
+
+    Sorts every matching play in source (chronological) order instead of
+    trusting the few records a similarity search returns. Returns None when
+    the question is not this simple shape.
+    """
+    q = question.lower()
+
+    if (
+        not FIRST_LAST_INTENT.search(q)
+        or COUNT_INTENT.search(q)
+        or record_type == "score"
+        or "hall of fame" in q
+        or not (season or seasons)
+    ):
+        return None
+
+    outcome_filter = infer_outcome_filter(question)
+
+    if not outcome_filter or "$or" in outcome_filter:
+        return None
+
+    teams, remaining = find_teams(q)
+
+    if len(teams) > 1:
+        return None
+
+    for pattern, _phrase in OUTCOME_PATTERNS:
+        remaining = re.sub(pattern, " ", remaining)
+
+    remaining = re.sub(r"\b20\d{2}\b", " ", remaining)
+    leftover = [
+        w for w in re.findall(r"[a-z0-9]+", remaining) if w not in FIRST_LAST_FILLER
+    ]
+
+    if leftover:
+        return None
+
+    want_last = bool(re.search(r"\b(last|latest|final)\b", q))
+    team = next(iter(teams)) if teams else None
+
+    where = build_where_filter(season=season, seasons=seasons, record_type="play")
+    where_document = combine_document_filters(
+        outcome_filter,
+        {"$contains": f"Possession: {team}."} if team else None,
+    )
+
+    records = get_all_records(where, where_document)
+    records.sort(key=chronological_key)
+
+    if not records:
+        return None
+
+    def pick(items):
+        return (items[-1] if want_last else items[0]) if items else None
+
+    overall = pick(records)
+    regular = pick([r for r in records if week_group(record_week(r)) == "regular"])
+
+    word = "last" if want_last else "first"
+    label = OUTCOME_LABELS.get(outcome_filter["$contains"], "play").rstrip("s")
+    subject = f" by the {team}" if team else ""
+
+    def describe(record):
+        doc = record["document"]
+        desc = re.search(r"Description:\s*(.*)$", doc, re.S)
+        week = record_week(record).title()
+        quarter = re.search(r"Quarter:\s*(.*?)\.", doc)
+        date = re.search(r"Date:\s*(.*?)\.", doc)
+        game = re.search(r"Home team:\s*(.*?)\.\s*Away team:\s*(.*?)\.", doc)
+        parts = [week]
+        if date:
+            parts.append(date.group(1))
+        if game:
+            parts.append(f"{game.group(2)} at {game.group(1)}")
+        if quarter:
+            parts.append(quarter.group(1))
+        text = desc.group(1).strip() if desc else ""
+        return f"{text} ({', '.join(parts)}; record `{record['id']}`)"
+
+    answer = (
+        f"The {word} {label}{subject} {season_phrase(season, seasons)} "
+        f"(preseason and Hall of Fame included) was:\n\n{describe(overall)}"
+    )
+
+    if regular is not None and regular is not overall:
+        answer += (
+            f"\n\nThe {word} regular-season one was:\n\n{describe(regular)}"
+        )
+
+    answer += (
+        "\n\nFound by sorting every matching play in the database in game "
+        "order, not by the model. The scorer is the player named in the play "
+        "description (players are stored as initials)."
+    )
+
+    sources = [overall] + ([regular] if regular is not None and regular is not overall else [])
+
+    return {"answer": answer, "sources": sources, "warning": None, "llm_error": False}
+
+
 def ask_question(
     question,
     season=None,
@@ -1036,6 +1148,16 @@ def ask_question(
 
     if counted is not None:
         return counted
+
+    first_last = answer_first_last_question(
+        question,
+        effective_season,
+        effective_seasons,
+        effective_type,
+    )
+
+    if first_last is not None:
+        return first_last
 
     records = retrieve_plays(
         question=question,
