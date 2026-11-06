@@ -7,6 +7,8 @@ local Llama 3 model, and shows the records behind every answer.
 Everything runs locally: ChromaDB for storage, `all-MiniLM-L6-v2` for
 embeddings, Llama 3 through Ollama for generation, and Streamlit for the UI.
 
+![App screenshot](screenshot.png)
+
 ## Why it is built this way
 
 Retrieval-augmented generation alone fails on this data. A language model
@@ -58,6 +60,10 @@ pip install -r requirements.txt
 5. **Reproduce the evaluation** (see below):
    ```bash
    python evaluate.py
+   ```
+6. **Run the tests** (no Ollama or database needed):
+   ```bash
+   python -m unittest test_rag -v
    ```
 
 ## Example questions
@@ -133,6 +139,8 @@ model, because they use exact text filters and direct reads.
   recorded under another outcome label is not considered.
 - **Preseason and Hall of Fame games are included** in season totals; the
   breakdown shows them separately.
+- **Years outside 2010–2026 are ignored.** A question about, say, 2030 is
+  answered across all seasons instead of reporting that there is no data.
 - **The 2026 season** contains only preseason data in the source.
 - **Answer quality** from Llama 3 is not scored automatically. The
   evaluation covers retrieval and exact answers only.
